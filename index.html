@@ -45,7 +45,7 @@ input[type=password],input[type=text]{width:100%;padding:.75rem;border-radius:10
 <script>
 (function(){
 'use strict';
-var LS=window.localStorage,K_META='pv.meta',K_APP='pv.app',K_STATE='pv.state';
+var LS=window.localStorage,K_META='pv.meta',K_APP='pv.app',K_STATE='pv.state',K_FP='pv.fp';
 var ITER=600000,enc=new TextEncoder(),dec=new TextDecoder();
 var key=null,meta=null,appHtml='',mem=Object.create(null),chain=Promise.resolve(),timer=null,hiddenAt=0,fails=0;
 var root=document.getElementById('root'),modal=document.getElementById('modal'),mcard=document.getElementById('mcard'),toastEl=document.getElementById('toast');
@@ -105,34 +105,73 @@ function showSetup(){
  };
 }
 
+async function unlockWith(p){
+ meta=JSON.parse(LS.getItem(K_META));
+ var k=await derive(p,unb64(meta.salt),meta.iter);
+ var html=await unseal(k,LS.getItem(K_APP));
+ var st=JSON.parse(await unseal(k,LS.getItem(K_STATE)));
+ mem=Object.create(null);Object.keys(st).forEach(function(n){mem[n]=st[n]});
+ key=k;appHtml=html;fails=0;launch();
+}
 function showLock(){
- screen('<h1>🔒 Payments</h1><p>Enter your passcode.</p><input type="password" id="pw" placeholder="Passcode" autocomplete="current-password"><div class="err" id="err"></div><button class="btn pri" id="go">Unlock</button><button class="lnk" id="forgot">Forgot passcode? Erase this phone\'s copy</button>');
- var inp=$('pw');setTimeout(function(){inp.focus()},50);
+ var hasFp=!!LS.getItem(K_FP)&&!!window.PublicKeyCredential;
+ screen('<h1>🔒 Payments</h1><p>Enter your passcode.</p><input type="password" id="pw" placeholder="Passcode" autocomplete="current-password"><div class="err" id="err"></div><button class="btn pri" id="go">Unlock</button>'+(hasFp?'<button class="btn" id="fp">👆 Unlock with fingerprint</button>':'')+'<button class="lnk" id="forgot">Forgot passcode? Erase this phone\'s copy</button>');
+ var inp=$('pw');if(!hasFp)setTimeout(function(){inp.focus()},50);
  async function go(){
   var e=$('err'),p=inp.value;if(!p)return;
   $('go').disabled=true;$('go').textContent='Unlocking…';
   if(fails>=3){await new Promise(function(r){setTimeout(r,Math.min(60,Math.pow(2,fails-3))*1000)})}
-  try{
-   meta=JSON.parse(LS.getItem(K_META));
-   var k=await derive(p,unb64(meta.salt),meta.iter);
-   var html=await unseal(k,LS.getItem(K_APP));
-   var st=JSON.parse(await unseal(k,LS.getItem(K_STATE)));
-   mem=Object.create(null);Object.keys(st).forEach(function(n){mem[n]=st[n]});
-   key=k;appHtml=html;fails=0;launch();
-  }catch(x){fails++;e.textContent='Wrong passcode.';$('go').disabled=false;$('go').textContent='Unlock';inp.value='';inp.focus()}
+  try{await unlockWith(p)}
+  catch(x){fails++;e.textContent='Wrong passcode.';$('go').disabled=false;$('go').textContent='Unlock';inp.value='';inp.focus()}
  }
  $('go').onclick=go;inp.onkeydown=function(ev){if(ev.key==='Enter')go()};
+ if(hasFp)$('fp').onclick=async function(){
+  var e=$('err');e.textContent='';
+  try{await unlockWith(await fpGetPass())}
+  catch(x){e.textContent='Fingerprint did not work. Use your passcode.'}
+ };
  $('forgot').onclick=function(){
   if(confirm('This permanently erases the encrypted data stored on this phone. You will need your original payments file (or a backup plus its passcode) to start again. Erase it?')){
-   [K_META,K_APP,K_STATE].forEach(function(k){LS.removeItem(k)});showSetup()}
+   [K_META,K_APP,K_STATE,K_FP].forEach(function(k){LS.removeItem(k)});showSetup()}
  };
+}
+
+/* ---- fingerprint unlock (passkey + PRF wraps the passcode) ---- */
+async function prfKey(id,salt){
+ var a=await navigator.credentials.get({publicKey:{challenge:crypto.getRandomValues(new Uint8Array(32)),rpId:location.hostname,allowCredentials:[{type:'public-key',id:id}],userVerification:'required',timeout:60000,extensions:{prf:{eval:{first:salt}}}}});
+ var r=a.getClientExtensionResults().prf;
+ if(!r||!r.results||!r.results.first)throw new Error('no prf');
+ var m=await crypto.subtle.importKey('raw',r.results.first,'HKDF',false,['deriveKey']);
+ return crypto.subtle.deriveKey({name:'HKDF',hash:'SHA-256',salt:new Uint8Array(0),info:enc.encode('pv-fp-1')},m,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+async function fpGetPass(){var f=JSON.parse(LS.getItem(K_FP));return unseal(await prfKey(unb64(f.id),unb64(f.salt)),f.wrapped)}
+async function enableFp(){
+ if(!window.PublicKeyCredential){toast('This browser does not support fingerprint unlock.');return}
+ var v=await ask('Turn on fingerprint unlock',['Your passcode'],'Continue');
+ if(!v)return;
+ try{var kk=await derive(v[0],unb64(meta.salt),meta.iter);await unseal(kk,LS.getItem(K_APP))}
+ catch(x){modal.style.display='none';toast('Wrong passcode.');return}
+ modal.style.display='none';
+ try{
+  var salt=crypto.getRandomValues(new Uint8Array(32));
+  var cred=await navigator.credentials.create({publicKey:{rp:{name:'Payments',id:location.hostname},user:{id:crypto.getRandomValues(new Uint8Array(16)),name:'owner',displayName:'Owner'},challenge:crypto.getRandomValues(new Uint8Array(32)),pubKeyCredParams:[{type:'public-key',alg:-7},{type:'public-key',alg:-257}],authenticatorSelection:{authenticatorAttachment:'platform',userVerification:'required',residentKey:'preferred'},timeout:60000,extensions:{prf:{}}}});
+  var id=new Uint8Array(cred.rawId),k=await prfKey(id,salt);
+  LS.setItem(K_FP,JSON.stringify({id:b64(id),salt:b64(salt),wrapped:await seal(k,v[0])}));
+  toast('Fingerprint unlock is on');
+ }catch(x){toast('Could not turn on fingerprint on this phone. Your passcode still works.')}
+ fpLabel();
+}
+function fpLabel(){var b=$('m-fp');if(b)b.textContent=LS.getItem(K_FP)?'Turn off fingerprint unlock':'Turn on fingerprint unlock'}
+function fpToggle(){
+ if(LS.getItem(K_FP)){if(confirm('Turn off fingerprint unlock? You will use your passcode.')){LS.removeItem(K_FP);fpLabel();toast('Fingerprint unlock is off')}}
+ else enableFp();
 }
 
 /* ---- unlocked app ---- */
 var frame=null;
 function launch(){
  root.innerHTML='<div id="bar"><b>🔒 Payments</b><button id="lock">Lock</button><button id="mnu">⋯</button></div>'+
- '<div id="menu"><button id="m-bak">Download encrypted backup</button><label>Restore from backup<input type="file" id="m-res" accept=".pvault,application/json"></label><label>Update app file<input type="file" id="m-upd" accept=".html,text/html"></label><button id="m-pass">Change passcode</button></div>';
+ '<div id="menu"><button id="m-bak">Download encrypted backup</button><label>Restore from backup<input type="file" id="m-res" accept=".pvault,application/json"></label><label>Update app file<input type="file" id="m-upd" accept=".html,text/html"></label><button id="m-fp"></button><button id="m-pass">Change passcode</button></div>';
  var shimScript='<script>(function(){var s=parent.__vaultStore;Object.defineProperty(window,"localStorage",{get:function(){return s},configurable:true});})();<\/script>';
  var out=appHtml.replace(/<head[^>]*>/i,function(m){return m+shimScript});
  if(out===appHtml)out=shimScript+appHtml;
@@ -140,7 +179,7 @@ function launch(){
  $('lock').onclick=lockNow;
  $('mnu').onclick=function(ev){ev.stopPropagation();var m=$('menu');m.style.display=m.style.display==='block'?'none':'block'};
  document.addEventListener('click',function(){var m=$('menu');if(m)m.style.display='none'});
- $('m-bak').onclick=backup;$('m-res').onchange=restore;$('m-upd').onchange=updateApp;$('m-pass').onclick=changePass;
+ $('m-bak').onclick=backup;$('m-res').onchange=restore;$('m-upd').onchange=updateApp;$('m-pass').onclick=changePass;$('m-fp').onclick=fpToggle;fpLabel();
 }
 async function lockNow(){await saveNow();key=null;location.reload()}
 
@@ -157,7 +196,7 @@ async function restore(){
   if(!o||o.pv!==1||!o.meta||!o.app||!o.state)throw new Error('bad');
   if(!confirm('Replace everything on this phone with this backup? You will unlock it with the passcode it was made with.'))return;
   await saveNow();
-  LS.setItem(K_META,o.meta);LS.setItem(K_APP,o.app);LS.setItem(K_STATE,o.state);
+  LS.setItem(K_META,o.meta);LS.setItem(K_APP,o.app);LS.setItem(K_STATE,o.state);LS.removeItem(K_FP);
   key=null;location.reload();
  }catch(x){toast('That is not a valid backup file.')}
 }
@@ -190,7 +229,7 @@ async function changePass(){
   await saveNow();
   var a=await seal(nk,appHtml),s=await seal(nk,JSON.stringify(mem));
   LS.setItem(K_APP,a);LS.setItem(K_STATE,s);LS.setItem(K_META,JSON.stringify(nm));
-  key=nk;meta=nm;modal.style.display='none';toast('Passcode changed');
+  LS.removeItem(K_FP);fpLabel();key=nk;meta=nm;modal.style.display='none';toast('Passcode changed. Turn fingerprint unlock back on in the menu.');
  }catch(x){e.textContent='Failed: '+x.message}
 }
 function changePassRetry(){setTimeout(changePass,0)}
