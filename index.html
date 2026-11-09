@@ -125,11 +125,13 @@ function showLock(){
   catch(x){fails++;e.textContent='Wrong passcode.';$('go').disabled=false;$('go').textContent='Unlock';inp.value='';inp.focus()}
  }
  $('go').onclick=go;inp.onkeydown=function(ev){if(ev.key==='Enter')go()};
- if(hasFp)$('fp').onclick=async function(){
+ async function runFp(){
   var e=$('err');e.textContent='';
   try{await unlockWith(await fpGetPass())}
-  catch(x){e.textContent='Fingerprint did not work. Use your passcode.'}
- };
+  catch(x){e.textContent='Fingerprint did not work. Use your passcode or tap the button.'}
+ }
+ if(hasFp){$('fp').onclick=runFp;var manual=false;try{manual=sessionStorage.getItem('pv.manual')==='1';sessionStorage.removeItem('pv.manual')}catch(x){}
+  if(!manual)setTimeout(runFp,250)}
  $('forgot').onclick=function(){
   if(confirm('This permanently erases the encrypted data stored on this phone. You will need your original payments file (or a backup plus its passcode) to start again. Erase it?')){
    [K_META,K_APP,K_STATE,K_FP].forEach(function(k){LS.removeItem(k)});showSetup()}
@@ -181,7 +183,7 @@ function launch(){
  document.addEventListener('click',function(){var m=$('menu');if(m)m.style.display='none'});
  $('m-bak').onclick=backup;$('m-res').onchange=restore;$('m-upd').onchange=updateApp;$('m-pass').onclick=changePass;$('m-fp').onclick=fpToggle;fpLabel();
 }
-async function lockNow(){await saveNow();key=null;location.reload()}
+async function lockNow(){await saveNow();key=null;try{sessionStorage.setItem('pv.manual','1')}catch(x){}location.reload()}
 
 async function backup(){
  await saveNow();
